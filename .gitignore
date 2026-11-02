@@ -1,0 +1,14 @@
+# data lives on Google Drive, not in git
+countdown/data/
+countdown/.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.zip
+proposal.docx
+# LaTeX build output
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.synctex.gz

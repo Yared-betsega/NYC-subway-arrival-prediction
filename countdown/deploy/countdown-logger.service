@@ -1,0 +1,18 @@
+# systemd unit for the Google Cloud VM (system-wide service).
+# Install:  sudo cp countdown-logger.service /etc/systemd/system/
+#           sudo systemctl daemon-reload && sudo systemctl enable --now countdown-logger
+# Replace YOUR_USER with the VM username (run `whoami` in the SSH window).
+[Unit]
+Description=Record MTA subway predictions and train positions every 30 s
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=YOUR_USER
+WorkingDirectory=/home/YOUR_USER/countdown
+ExecStart=/home/YOUR_USER/countdown/.venv/bin/python /home/YOUR_USER/countdown/logger.py --out /home/YOUR_USER/countdown/data/raw
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
