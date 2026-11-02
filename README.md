@@ -1,6 +1,6 @@
-# Countdown Clock Challenge (Group 8)
+# Predicting NYC Subway Arrivals Better Than the MTA's Countdown Clocks
 
-**Yared Tsegaye Gizaw · Alefew Yimam** · Deep Learning final project, Fall 2026
+**Countdown Clock Challenge** · Group 8: **Yared Tsegaye Gizaw · Alefew Yimam** · Deep Learning final project, Fall 2026
 
 Can a neural network predict when an NYC subway train will arrive more accurately than the MTA's own platform countdown clocks?
 
