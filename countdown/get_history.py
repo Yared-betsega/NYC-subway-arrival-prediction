@@ -8,19 +8,38 @@ Files already downloaded are skipped, so it is safe to rerun.
 
 Usage:  python get_history.py [--start 2026-05-01] [--end 2026-11-13] [--out data/history]
 """
-import argparse, os, time
+import argparse, os, tarfile, time
 from datetime import date, timedelta
 
+import pandas as pd
 import requests
 
 URL = 'https://subwaydata.nyc/data/subwaydatanyc_{}_csv.tar.xz'
+HISTORY = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'history')
+
+
+def load_day(day, folder=HISTORY):
+    """One history day as a table: trip_uid, trip_id, route_id, direction_id, stop_id, t (arrival, or departure at the
+    first stop), departure_time. None if that day was not downloaded."""
+    path = os.path.join(folder, f'subwaydatanyc_{day}_csv.tar.xz')
+    if not os.path.exists(path):
+        return None
+    with tarfile.open(path) as tf:
+        st = pd.read_csv(tf.extractfile(f'subwaydatanyc_{day}_stop_times.csv'),
+                         usecols=['trip_uid', 'stop_id', 'arrival_time', 'departure_time'])
+        trips = pd.read_csv(tf.extractfile(f'subwaydatanyc_{day}_trips.csv'),
+                            usecols=['trip_uid', 'trip_id', 'route_id', 'direction_id'], dtype={'route_id': str})
+    st['t'] = st.arrival_time.fillna(st.departure_time)
+    st = st.dropna(subset=['t']).merge(trips, on='trip_uid')
+    st['t'] = st.t.astype('int64')
+    return st
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--start', default='2026-05-01')
     ap.add_argument('--end', default='2026-11-13')
-    ap.add_argument('--out', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'history'))
+    ap.add_argument('--out', default=HISTORY)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
