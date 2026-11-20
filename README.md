@@ -64,6 +64,12 @@ prediction = anchor time + base + ŷ
 
 `rows.py` asserts that every feature was known at or before *p* (leakage check).
 
+**How to use the columns in a model (M1):**
+- **Sequence input (LSTM):** `sd8 … sd1`, 8 steps, oldest first.
+- **Other inputs:** `base, n_stops, elapsed, overdue, hour, weekend, route, direction, dev1, dev3, gap, ahead_dev, ahead_pace, ahead_frac, ahead_since`. All are in seconds except `hour`, `weekend`, `route` (categorical: embed or one-hot), `direction` and `ahead_frac` (0–1). An empty value means "not available" (no train ahead on that stretch, or near the start of a trip): fill it with 0 and add a 0/1 "missing" flag.
+- **Target:** `y`. Predicted arrival = `t` (anchor arrival time) + `base` + predicted `y`.
+- **Never inputs:** `trip, p, stop_id_b, t, t_b, lead, mta_pred`. They are identifiers, the answer, or the MTA's forecast; `lead` is only for grouping errors by horizon band.
+
 ---
 
 ## 3. Architecture
@@ -121,36 +127,44 @@ countdown/
   logger.py                    ✅ recorder: 8 feeds every 30 s → data/raw/YYYY-MM-DD/{predictions,vehicles}.csv.gz
   deploy/                      ✅ systemd unit + VM setup guide (SETUP_VM.md)
   requirements.txt
-  get_history.py               ⏳ download subwaydata.nyc → data/history/
-  labels.py                    ⏳ arrival = first STOPPED_AT report per (trip, stop); merges VM + PC copies
+  repair.py                    ✅ salvages recordings cut off by a crash or power loss (used automatically by labels.py)
+  get_history.py               ✅ download subwaydata.nyc May 1 – Nov 13 (197 days, 241 MB) → data/history/
+  labels.py                    ✅ arrival = first STOPPED_AT report per (trip, stop), VM + PC copies pooled
+                                  → data/labels/arrivals.parquet (2.9 M arrivals, Oct 31 – Nov 14)
   correction.py                ⏳ per-station offset, history → STOPPED_AT definition
-  rows.py                      ⏳ feature rows → data/rows/*.parquet
+  rows.py                      ⏳ feature rows → data/rows/{history,train,val}.parquet
   baselines.py                 ⏳ B1, B2
   score.py                     ⏳ the scorer
+  notebooks/data_tour.ipynb    ✅ head() of every dataset above, with readable times
   notebooks/                   ⏳ Colab: m1_lstm.ipynb, m2a_bilstm.ipynb, m2b_transformer.ipynb
   board/                       ⏳ live board (FastAPI + phone web app)
 ```
 
+Measured on Oct 31 – Nov 13: history times run **30 s** (numbered lines) and **77 s** (lettered lines, median) later than the STOPPED_AT arrival, the same as the pilot.
+
 Data is **not** in git. It lives on the shared Google Drive folder `Countdown-Group8/`:
-- `raw/`: weekly `.tgz` of the recordings;
-- `rows/`: the feature rows. **This is what Colab trains on.**
+- `raw/`: the recordings, one folder per week (`2026-10-31_to_2026-11-07/`, `2026-11-08_to_2026-11-14/`), with one subfolder per day holding `predictions.csv.gz` and `vehicles.csv.gz`. **Backup only; nobody trains on these directly.** The test week (Nov 15–21) is added on Nov 22.
+- `rows/`: the feature rows, `history.parquet`, `train.parquet` and `val.parquet`. **This is what Colab trains on.** Load with `pd.read_parquet('/content/drive/MyDrive/Countdown-Group8/rows/train.parquet')` after mounting Drive.
 - `models/`: trained checkpoints.
+
+Only one set of rows is built (by `rows.py`, Yared), so every model trains and is scored on identical data.
 
 ---
 
 ## 5. Tasks
 
+Schedule revised Nov 19: the rows are later than planned, so the model steps are compressed. A model may keep training after Nov 21, as long as it never sees the test week before final scoring.
+
 ### Alefew
 
 | When | Task | Done when |
 |---|---|---|
-| **Now – Nov 5** | Read this README and §3–4 of the proposal. Get access to the repo and the Drive folder. Set up a Colab notebook (`notebooks/m1_lstm.ipynb`) that loads `rows/*.parquet` and builds a PyTorch Dataset (the column names are in §2). | Notebook loads the sample rows (uploaded by Nov 5) |
-| Nov 3 – 7 | Review `score.py` (the proposal lists you as its reviewer). | Comments sent / issues opened |
-| **Nov 6 – 12** | **M1 per-train LSTM.** Pretrain on history rows, fine-tune on training-week rows, early-stop on the validation week. Use Adam, dropout, batch norm and Xavier init. Report validation MAE by horizon band, next to B2. | Checkpoint in `models/`, validation table |
-| **Nov 12 – 16** | **M2a line-wide BiLSTM.** First agree with Yared on the line-wide input format, since M2b uses the same one. | Checkpoint + validation table |
-| Nov 21 | Freeze M1 and M2a. **No changes after this.** | Final checkpoints on Drive |
-| **Nov 21 – 25** | **Live board** (`board/`). FastAPI backend on the VM reads the feed every 30 s, builds rows, and runs the best model exported to ONNX. Phone web app with a station picker, one row per train (MTA vs ours), and a replay mode as a demo backup. | Opens on a phone at one station |
-| Nov 22 – 24 | Final scoring with Yared. | Test-week table |
+| **Nov 19 – 20** | Read this README (§2 has the columns and how to use them). Get access to the repo and the Drive folder. Write `notebooks/m1_lstm.ipynb` in Colab: load `rows/*.parquet`, build the PyTorch Dataset (sequence `sd8…sd1` + other inputs + missing flags), the model and the training loop. | Notebook ready to run when the rows land |
+| **Nov 20 – 23** | **Train M1 per-train LSTM.** Pretrain on `history.parquet`, fine-tune on `train.parquet`, early-stop on `val.parquet`. Use Adam, dropout, batch norm and Xavier init. Report validation MAE by horizon band, next to B2. | Checkpoint in `models/`, validation table |
+| Nov 21 – 22 | Review `score.py` (the proposal lists you as its reviewer). | Comments sent |
+| **Nov 22 – 25** | **M2a line-wide BiLSTM.** Yared defines the line-wide input format (shared with M2b) by Nov 22. | Checkpoint + validation table |
+| Nov 24 – 27 | **Live board** (`board/`), scaled to fit: replay of a recorded evening first, live feed if time allows. | Opens on a phone |
+| Nov 26 | Final scoring with Yared. | Test-week table |
 | Nov 26 – 30 | Report and presentation (both). | Submitted |
 
 ### Yared
@@ -158,13 +172,13 @@ Data is **not** in git. It lives on the shared Google Drive folder `Countdown-Gr
 | When | Task | Done when |
 |---|---|---|
 | ✅ Oct 31 | Recorder on a GCP VM (main) and the PC (backup). Both verified to record the same arrivals. | — |
-| **Nov 2 – 5** | `get_history.py`, `labels.py`, `correction.py`, `rows.py`. **Upload sample rows to Drive by Nov 5** so Alefew can start. | Rows on Drive, leakage check passes |
-| **Nov 3 – 7** | B1 and B2 baselines, `score.py`. **Freeze the scorer on Nov 7.** | Scorer in git |
-| Nov 8 | Upload week 1 to Drive. Rebuild rows on the full training week. **Milestone: baseline table** (B0/B1/B2). | Table in this README |
-| Nov 8 – 16 | Review M1 and M2a. Upload week 2 on Nov 15. | — |
+| ✅ Nov 16 | History downloaded (May 1 – Nov 13). Weeks 1–2 on Drive. Arrival labels built and checked (30 s / 77 s offsets). | — |
+| **Nov 19 – 20** | `correction.py`, `rows.py`. **Upload rows to Drive.** | Rows on Drive, leakage check passes |
+| **Nov 20 – 22** | B1 and B2 baselines, `score.py`. Freeze the scorer. Define the line-wide input format for M2a/M2b. | Scorer in git, baseline table |
 | **Nov 15 – 21** | Keep the PC recording (test-week backup). | No gaps |
-| **Nov 16 – 20** | **M2b line-wide transformer.** Same input as M2a. Freeze on Nov 21. | Checkpoint + validation table |
-| Nov 22 – 24 | Upload week 3. Run `score.py` once on the test week for every model, plus the splits and the sensitivity check. | Test-week table |
+| Nov 22 | Upload the test week to Drive (not opened). | — |
+| **Nov 22 – 25** | **M2b line-wide transformer.** Same input as M2a. Review M1 and M2a. | Checkpoint + validation table |
+| Nov 26 | Run `score.py` once on the test week for every model, plus the splits and the sensitivity check. | Test-week table |
 | Nov 26 – 30 | Report and presentation (both). Delete the VM in December. | Submitted |
 
 ### Rules for both
