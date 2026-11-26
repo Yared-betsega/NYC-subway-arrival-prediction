@@ -10,11 +10,16 @@ Sources, all through the same build() so the files cannot drift apart:
                    recordings. A sample of trips, one moment every 15 min.
   train.parquet    p on Oct 31 - Nov 7, arrivals from labels.py, plus the MTA's forecast at p (mta_pred, scoring only).
   val.parquet      p on Nov 8 - 14, same.
+  test.parquet     p on Nov 15 - 21, same; built only with --test, after the models are written, and never summarized here.
 Typical segment times ("base") are medians over Sep 1 - Oct 30 of history, by line, stop pair, time band and weekend.
 The test week is never read. Everything is built and written one day at a time, so memory stays around 2 GB.
 
 Usage:  python rows.py                 full build → data/rows/{history,train,val}.parquet
         python rows.py --days 2        quick test on 2 days per part → data/rows_test/
+        python rows.py --test          test week only → data/rows/test.parquet (train/val/history untouched)
+        python rows.py --lines         also line_<part>.parquet: one token per train of the line at each row moment
+                                       (trip, p, route, direction, query, pos, elapsed, overdue, dev1, dev3, gap, sd1..sd8);
+                                       a row's snapshot is (route, direction, p), its own train is the token with query=True
 """
 import argparse, gzip, os, resource, time
 
@@ -34,6 +39,7 @@ MEDIAN_DAYS = ('2026-09-01', '2026-10-30')
 HISTORY_DAYS = ('2026-05-01', '2026-10-30')
 LIVE_DAYS = ('2026-10-31', '2026-11-14')
 VAL_FROM = '2026-11-08'
+TEST_DAYS = ('2026-11-15', '2026-11-21')     # --test only; labels from arrivals_test.parquet
 HORIZON = 1800                 # predict up to 30 min ahead
 J = 30                         # look at most this many stops ahead of the anchor
 K = 8                          # past segment delays kept for the LSTM (sd1..sd8)
@@ -43,6 +49,8 @@ POLL_COPY = {'2026-10-31': 'raw'}          # which recording supplies the MTA fo
 BANDS = [0, 120, 300, 600, 1200, 1800]
 FEATURES = ['base', 'n_stops', 'elapsed', 'overdue', 'hour', 'weekend', 'dev1', 'dev3', 'gap',
             'ahead_dev', 'ahead_pace', 'ahead_frac', 'ahead_since'] + [f'sd{k}' for k in range(1, K + 1)]
+STALE = 900                    # line tables: a train not confirmed at any stop for 15 min is left out of the snapshot
+TOKEN_FEATURES = ['pos', 'elapsed', 'overdue', 'dev1', 'dev3', 'gap'] + [f'sd{k}' for k in range(1, K + 1)]
 
 
 def days(first, last):
@@ -81,6 +89,11 @@ class Medians:
         v = np.where(np.isnan(v), self.m2.reindex(a * 4096 + b).to_numpy(), v)
         return np.where(b < 0, np.nan, v)
 
+    def position(self, r, a):
+        """Typical seconds from the line's first stop to stop a (line tables: orders trains along the route)."""
+        v = self.pos.reindex(r * 4096 + a).to_numpy()
+        return np.where(np.isnan(v), self.pos_stop.reindex(a).to_numpy(), v)
+
 
 def history_events(day, corr):
     """One history day: arrivals only (origin stops have just a departure), shifted onto STOPPED_AT time."""
@@ -95,7 +108,7 @@ def history_events(day, corr):
 
 def segment_medians(corr, stops, routes, limit):
     """Stop-to-stop times from history, for neighbours 1-3 stops apart (recordings can miss a short stop)."""
-    k1s, segs = [], []
+    k1s, segs, pk, pv, hk, hv = [], [], [], [], [], []
     for d in days(*MEDIAN_DAYS)[-limit:] if limit else days(*MEDIAN_DAYS):
         ev = history_events(d, corr)
         if ev is None:
@@ -104,6 +117,9 @@ def segment_medians(corr, stops, routes, limit):
         tr, t = ev.trip.to_numpy(), ev.t.to_numpy()
         a, r = stops.codes(ev.stop_id), routes.codes(ev.route_id)
         _, hb, wk = bands(t)
+        first = np.r_[True, tr[1:] != tr[:-1]]
+        pk.append(r * 4096 + a)
+        pv.append((t - t[np.maximum.accumulate(np.where(first, np.arange(len(t)), 0))]).astype('int32'))
         for k in (1, 2, 3):
             ok = np.zeros(len(t), bool)
             ok[:-k] = tr[k:] == tr[:-k]
@@ -113,12 +129,21 @@ def segment_medians(corr, stops, routes, limit):
             b = np.zeros_like(a)
             b[:-k] = a[k:]
             k1s.append(key1(r, a, b, hb, wk)[ok]); segs.append(seg[ok].astype('int16'))
-    return Medians(np.concatenate(k1s), np.concatenate(segs))
+            if k == 1:
+                hk.append((r * 4096 + a)[ok]); hv.append(seg[ok].astype('int16'))
+    med = Medians(np.concatenate(k1s), np.concatenate(segs))
+    pk, pv = np.concatenate(pk), pd.Series(np.concatenate(pv))
+    med.pos, med.pos_stop = pv.groupby(pk).median(), pv.groupby(pk % 4096).median()
+    med.hop = pd.Series(np.concatenate(hv)).groupby(np.concatenate(hk)).median()   # typical next hop out of a stop
+    return med
 
 
-def build(ev, every, frac, rng, med, stops, routes, polls=None):
+def build(ev, every, frac, rng, med, stops, routes, polls=None, lines=False, moments=None):
     """Rows for one day of events (trip, route_id, stop_id, t, known). Moments every `every` s per trip (random phase),
-    for a `frac` sample of trips; with `polls`, moments snap to the next recorded poll (so the MTA forecast exists)."""
+    for a `frac` sample of trips; with `polls`, moments snap to the next recorded poll (so the MTA forecast exists).
+    With lines=True also returns the line table: at every moment that has rows, one token per train of the same line
+    and direction (its state as known at p), for the line-wide models M2a/M2b.
+    With `moments` (trip, p), those moments are used instead of drawing new ones (to match rows already built)."""
     ev = ev.sort_values(['trip', 't'], kind='stable').reset_index(drop=True)
     n = len(ev)
     tc, trip_names = pd.factorize(ev.trip)
@@ -161,7 +186,12 @@ def build(ev, every, frac, rng, med, stops, routes, polls=None):
     mt = np.repeat(np.arange(ntr), cnt)
     within = np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)
     p = (t0[mt] + phase[mt] + every * within).astype('int64')
-    if polls is not None:
+    if moments is not None:                                       # random draws above still made: keeps the stream aligned
+        m = moments[moments.trip.isin(trip_names)]
+        mt, p = pd.Index(trip_names).get_indexer(m.trip), m.p.to_numpy('int64')
+        ok = (p >= t0[mt]) & (p <= t1[mt] + 60)                   # a trip id can recur on another day's history file
+        mt, p = mt[ok], p[ok]
+    elif polls is not None:
         i = np.minimum(np.searchsorted(polls, p), len(polls) - 1)
         ok = (polls[i] >= p) & (polls[i] - p <= 45)
         mt, p = mt[ok], polls[i][ok]
@@ -216,7 +246,48 @@ def build(ev, every, frac, rng, med, stops, routes, polls=None):
         'ahead_frac': np.where(on_way, stretch / np.maximum(base, 1), np.nan),
         'ahead_since': np.where(on_way, P - t[PCc], np.nan),
         **{f'sd{k}': shift(sd, k)[A] for k in range(1, K + 1)}})
-    return out
+    if not lines:
+        return out
+
+    # line tables: snapshots (line, direction, p) at the moments that have rows; every train of that line seen in the
+    # last 15 min joins with its state as known at p. Same feature formulas as the row's anchor features above.
+    dr = (ev.stop_id.str[-1].to_numpy() == 'S').astype('int64')
+    M = np.unique(mi)
+    snaps = pd.DataFrame({'g': r[ra[M]] * 2 + dr[ra[M]], 'p': p[M]}).drop_duplicates()
+    g_trip, k0, k1 = (r * 2 + dr)[first], known[first], known[last] + STALE   # k1 only narrows candidates (see below)
+    pt, pp, pq = [mt[M]], [p[M]], [np.ones(len(M), bool)]                     # the predicted train is always included
+    for g, s in snaps.groupby('g'):
+        ps = np.sort(s.p.to_numpy())
+        trips = np.nonzero(g_trip == g)[0]
+        lo, hi = np.searchsorted(ps, k0[trips]), np.searchsorted(ps, k1[trips], side='right')
+        cnt = np.maximum(hi - lo, 0)
+        within = np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+        pt.append(np.repeat(trips, cnt)); pp.append(ps[np.repeat(lo, cnt) + within]); pq.append(np.zeros(cnt.sum(), bool))
+    pairs = (pd.DataFrame({'tc': np.concatenate(pt), 'p': np.concatenate(pp), 'q': np.concatenate(pq)})
+             .sort_values('q', ascending=False).drop_duplicates(['tc', 'p']))
+    I = latest(pairs.tc.to_numpy(), pairs.p.to_numpy())
+    Pt, q = pairs.p.to_numpy(), pairs.q.to_numpy()
+    keep = (I >= 0) & (q | (Pt - known[np.maximum(I, 0)] <= STALE))         # staleness uses only what is known at p
+    I, Pt, q = I[keep], Pt[keep], q[keep]
+    pj = prev[I]
+    pj = np.where((pj >= 0) & (known[np.maximum(pj, 0)] <= Pt), pj, -1)
+    assert (known[I] <= Pt).all() and (known[np.maximum(pj, 0)][pj >= 0] <= Pt[pj >= 0]).all(), 'line table leaks'
+    el = Pt - t[I]
+    # a trip's last recorded stop has no next hop; whether a stop is the last one is future knowledge, so there the
+    # line's typical next hop out of that stop (history) is used. Rows never anchor on a last stop, so they are unaffected.
+    hop = np.where(last[I], med.hop.reindex(r[I] * 4096 + a[I]).to_numpy(), segmed[I])
+    tok = pd.DataFrame({
+        'trip': trip_names[tc[I]], 'p': Pt, 'route': ev.route_id.to_numpy()[I], 'direction': dr[I].astype('int8'),
+        'query': q, 'pos': med.position(r[I], a[I]) + np.clip(el, 0, np.nan_to_num(hop)),
+        'elapsed': el, 'overdue': el - hop, 'dev1': dev[1][I], 'dev3': dev[3][I],
+        'gap': np.where(pj >= 0, t[I] - t[np.maximum(pj, 0)], np.nan),
+        **{f'sd{k}': shift(sd, k)[I] for k in range(1, K + 1)}})
+    return out, tok.sort_values(['route', 'direction', 'p', 'pos'], kind='stable').reset_index(drop=True)
+
+
+def finalize_tokens(tok):
+    tok[TOKEN_FEATURES] = tok[TOKEN_FEATURES].astype('float32')
+    return tok
 
 
 def finalize(df):
@@ -246,7 +317,7 @@ def attach_mta(rows, copy_of_day):
                 found.append(batch.filter(pc.is_in(key, value_set=wanted)).to_pandas())
         f = pd.concat(found)
         f['mta_pred'] = f.arr.where(f.arr > 0, f.dep)
-        f = f[f.mta_pred > 0]                                     # the feed sometimes sends 0 for both: no forecast.drop_duplicates(['poll', 'trip_id', 'start_date', 'stop_id'])
+        f = f[f.mta_pred > 0].drop_duplicates(['poll', 'trip_id', 'start_date', 'stop_id'])   # 0 for both = no forecast
         m = need.reset_index().merge(f, left_on=['p', 'trip_id', 'start_date', 'stop_id'],
                                      right_on=['poll', 'trip_id', 'start_date', 'stop_id'], how='left')
         rows.loc[m['index'], 'mta_pred'] = m.mta_pred.to_numpy()
@@ -285,11 +356,61 @@ def summary(name, rows):
     print(s.groupby('band', observed=True).agg(**cols).round(1).to_string())
 
 
+def live_events(lab, live_days):
+    """Recorded arrivals of the service days that can have moments on live_days (incl. the day before)."""
+    lab['trip'] = lab.trip_id + '|' + lab.start_date
+    lab['service_day'] = pd.to_datetime(lab.start_date).dt.strftime('%Y-%m-%d')
+    lab = lab[lab.service_day.isin(set(live_days) | {(pd.Timestamp(live_days[0]) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')})]
+    first_stop = lab.groupby('trip').arrived.transform('min') == lab.arrived
+    origins = set(load_day(HISTORY_DAYS[1]).query('arrival_time != arrival_time').stop_id)
+    return lab[~(first_stop & lab.stop_id.isin(origins))]        # same as history: origins never anchor or target
+
+
+def lines_main(args, out_dir, rng, t_start, corr, stops, routes, med, lab, lag):
+    """Line tables for the rows already in data/rows: same events, same random draws and the same moments (read from
+    the rows files), so every row's own train is in its snapshot with exactly the row's features. Rows are not rewritten."""
+    src = os.path.join(DATA, 'rows')
+    if not args.test:
+        mom = pd.read_parquet(os.path.join(src, 'history.parquet'), columns=['trip', 'p']).drop_duplicates()
+        lw = Writer(os.path.join(out_dir, 'line_history.parquet'))
+        for d in days(*HISTORY_DAYS)[:args.days] if args.days else days(*HISTORY_DAYS):
+            ev = history_events(d, corr)
+            if ev is None:
+                continue
+            ev['known'] = ev.t + rng.choice(lag, len(ev))         # same draw as the rows build
+            _, tok = build(ev, HIST_EVERY, HIST_FRAC, rng, med, stops, routes, lines=True, moments=mom)
+            lw.write(finalize_tokens(tok))
+        lw.close()
+        print(f'line_history: {lw.n:,} tokens ({time.time() - t_start:.0f} s, {mem()})')
+
+    live_days = days(*(TEST_DAYS if args.test else LIVE_DAYS))
+    if args.days:
+        live_days = live_days[:args.days] + [VAL_FROM]
+    parts = ['test'] if args.test else ['train', 'val']
+    mom = pd.concat([pd.read_parquet(os.path.join(src, f'{n}.parquet'), columns=['trip', 'p']) for n in parts]).drop_duplicates()
+    lwriters = {n: Writer(os.path.join(out_dir, f'line_{n}.parquet')) for n in parts}
+    for sd, ev in live_events(lab, live_days).groupby('service_day'):
+        ev = ev.rename(columns={'arrived': 't'})[['trip', 'route_id', 'stop_id', 't', 'known']]
+        _, tok = build(ev, LIVE_EVERY, 1.0, rng, med, stops, routes, lines=True, moments=mom)
+        tok = finalize_tokens(tok)
+        pday = pd.to_datetime(tok.p, unit='s', utc=True).dt.tz_convert(NY).dt.strftime('%Y-%m-%d')
+        for d, part in tok[pday.isin(live_days)].groupby(pday):
+            lwriters['test' if args.test else 'val' if d >= VAL_FROM else 'train'].write(part)
+        print(f'service day {sd}: {len(tok):,} tokens ({time.time() - t_start:.0f} s, {mem()})')
+    for n, wr in lwriters.items():
+        wr.close()
+        print(f'line_{n}: {wr.n:,} tokens')
+    print(f'done in {time.time() - t_start:.0f} s, {mem()} → {out_dir}')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--days', type=int, default=0, help='quick test: only this many days per part')
+    ap.add_argument('--test', action='store_true', help='build only the test week → rows/test.parquet (no error numbers shown)')
+    ap.add_argument('--lines', action='store_true', help='also write line_<part>.parquet (line-wide snapshots)')
+    ap.add_argument('--out', help='output folder (default data/rows)')
     args = ap.parse_args()
-    out_dir = os.path.join(DATA, 'rows_test' if args.days else 'rows')
+    out_dir = args.out or os.path.join(DATA, 'rows_test' if args.days else 'rows')
     os.makedirs(out_dir, exist_ok=True)
     rng, t_start = np.random.default_rng(0), time.time()
 
@@ -300,13 +421,15 @@ def main():
     med = segment_medians(corr, stops, routes, args.days)
     print(f'medians: {len(med.m1):,} detailed, {len(med.m2):,} stop pairs ({time.time() - t_start:.0f} s, {mem()})')
 
-    lab = pd.read_parquet(os.path.join(DATA, 'labels', 'arrivals.parquet'),
+    lab = pd.read_parquet(os.path.join(DATA, 'labels', 'arrivals_test.parquet' if args.test else 'arrivals.parquet'),
                           columns=['trip_id', 'start_date', 'route_id', 'stop_id', 'arrived', 'known'])
     lag = (lab.known - lab.arrived).clip(0, 120).to_numpy()
+    if args.lines:
+        return lines_main(args, out_dir, rng, t_start, corr, stops, routes, med, lab, lag)
 
-    # history, one day at a time
+    # history, one day at a time (not in --test mode)
     w = Writer(os.path.join(out_dir, 'history.parquet'))
-    for d in days(*HISTORY_DAYS)[:args.days] if args.days else days(*HISTORY_DAYS):
+    for d in [] if args.test else days(*HISTORY_DAYS)[:args.days] if args.days else days(*HISTORY_DAYS):
         ev = history_events(d, corr)
         if ev is None:
             continue
@@ -314,24 +437,21 @@ def main():
         rows = finalize(build(ev, HIST_EVERY, HIST_FRAC, rng, med, stops, routes))
         w.write(rows)
     w.close()
-    print(f'history: {w.n:,} rows ({time.time() - t_start:.0f} s, {mem()})')
-    summary('history (last day)', rows)
+    if w.n:
+        print(f'history: {w.n:,} rows ({time.time() - t_start:.0f} s, {mem()})')
+        summary('history (last day)', rows)
 
-    # recordings, one service day at a time. Rows go to train/val by the date of p; a day's rows are written once no
-    # later service day can add to that date (trips after midnight belong to the previous service day).
+    # recordings, one service day at a time. Rows go to train/val (or test) by the date of p; a day's rows are written
+    # once no later service day can add to that date (trips after midnight belong to the previous service day).
     copy_of_day = lambda d: POLL_COPY.get(d, 'vm')
-    live_days = days(*LIVE_DAYS)
+    live_days = days(*(TEST_DAYS if args.test else LIVE_DAYS))
     if args.days:
         live_days = live_days[:args.days] + [VAL_FROM]
     polls = np.unique(np.concatenate([pd.read_csv(os.path.join(DATA, copy_of_day(d), d, 'vehicles.csv.gz'),
                                                   usecols=['poll']).poll.unique() for d in live_days]))
-    lab['trip'] = lab.trip_id + '|' + lab.start_date
-    lab['service_day'] = pd.to_datetime(lab.start_date).dt.strftime('%Y-%m-%d')
-    lab = lab[lab.service_day.isin(set(live_days) | {(pd.Timestamp(live_days[0]) - pd.Timedelta(days=1)).strftime('%Y-%m-%d')})]
-    first_stop = lab.groupby('trip').arrived.transform('min') == lab.arrived
-    origins = set(load_day(HISTORY_DAYS[1]).query('arrival_time != arrival_time').stop_id)
-    lab = lab[~(first_stop & lab.stop_id.isin(origins))]          # same as history: origins never anchor or target
-    writers = {'train': Writer(os.path.join(out_dir, 'train.parquet')), 'val': Writer(os.path.join(out_dir, 'val.parquet'))}
+    lab = live_events(lab, live_days)
+    parts = ['test'] if args.test else ['train', 'val']
+    writers = {name: Writer(os.path.join(out_dir, f'{name}.parquet')) for name in parts}
     pending, shown = [], {}
     for sd, ev in lab.groupby('service_day'):
         ev = ev.rename(columns={'arrived': 't'})[['trip', 'route_id', 'stop_id', 't', 'known']]
@@ -343,14 +463,15 @@ def main():
         ready = allp.pday <= sd
         for d, part in allp[ready].groupby('pday'):
             part = attach_mta(part.drop(columns='pday').reset_index(drop=True), copy_of_day)
-            name = 'val' if d >= VAL_FROM else 'train'
+            name = 'test' if args.test else 'val' if d >= VAL_FROM else 'train'
             writers[name].write(part)
             shown[name] = part
         pending = [allp[~ready]]
     for name, wr in writers.items():
         wr.close()
         print(f'{name}: {wr.n:,} rows')
-        summary(f'{name} (last day)', shown[name])
+        if name != 'test':                                        # test-week errors are only ever computed by score.py
+            summary(f'{name} (last day)', shown[name])
     print(f'done in {time.time() - t_start:.0f} s, {mem()} → {out_dir}')
 
 

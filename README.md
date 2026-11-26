@@ -68,7 +68,15 @@ prediction = anchor time + base + ŷ
 - **Sequence input (LSTM):** `sd8 … sd1`, 8 steps, oldest first.
 - **Other inputs:** `base, n_stops, elapsed, overdue, hour, weekend, route, direction, dev1, dev3, gap, ahead_dev, ahead_pace, ahead_frac, ahead_since`. All are in seconds except `hour`, `weekend`, `route` (categorical: embed or one-hot), `direction` and `ahead_frac` (0–1). An empty value means "not available" (no train ahead on that stretch, or near the start of a trip): fill it with 0 and add a 0/1 "missing" flag.
 - **Target:** `y`. Predicted arrival = `t` (anchor arrival time) + `base` + predicted `y`.
-- **Never inputs:** `trip, p, stop_id_b, t, t_b, lead, mta_pred`. They are identifiers, the answer, or the MTA's forecast; `lead` is only for grouping errors by horizon band.
+- **Never inputs:** `trip, p, t, t_b, lead, mta_pred`. They are identifiers, the answer, or the MTA's forecast; `lead` is only for grouping errors by horizon band. `stop_id_b` (the target stop) *may* be used as a categorical input: it is known at *p*.
+
+**Line tables (M2a, M2b):** `line_{history,train,val,test}.parquet`, built by `rows.py --lines` at exactly the moments of the rows.
+- **One token = one train of the same line and direction at moment *p*** (seen at a stop in the last 15 min), with its state as known at *p*: `pos` (typical seconds from the line's first stop: sort by it to order trains along the route), `elapsed, overdue, dev1, dev3, gap, sd1…sd8` (same meaning as in the rows).
+- **Snapshot key:** `(route, direction, p)`, about 10 trains each (max 35). The row's own train is the token with `query=True`.
+- **Using it:** for each row, take its snapshot (join on `route, direction, p`), run the encoder over the trains ordered by `pos` (input `pos` relative to the query train), read the query train's output vector, and combine it with the row's own columns (`base, n_stops, ahead_*, stop_id_b, …`) to predict `y`. Same target and rows as M1, so the scores compare directly.
+- **Cleaning:** in history, drop duplicate tokens with `drop_duplicates(['route', 'direction', 'p', 'trip'])` (about 400 trip ids recur across two history days).
+
+**Predictions for `score.py`:** one parquet per model in `preds/<split>/<MODEL>.parquet` with columns `trip, p, stop_id_b, pred`, where `pred` = predicted arrival in Unix seconds (`t + base + ŷ`). `score.py <split>` scores every model in that folder on the same rows, next to the MTA (B0) and B1.
 
 ---
 
@@ -131,10 +139,10 @@ countdown/
   get_history.py               ✅ download subwaydata.nyc May 1 – Nov 13 (197 days, 241 MB) → data/history/
   labels.py                    ✅ arrival = first STOPPED_AT report per (trip, stop), VM + PC copies pooled
                                   → data/labels/arrivals.parquet (2.9 M arrivals, Oct 31 – Nov 14)
-  correction.py                ⏳ per-station offset, history → STOPPED_AT definition
-  rows.py                      ⏳ feature rows → data/rows/{history,train,val}.parquet
-  baselines.py                 ⏳ B1, B2
-  score.py                     ⏳ the scorer
+  correction.py                ✅ per-station offset, history → STOPPED_AT definition
+  rows.py                      ✅ feature rows → data/rows/{history,train,val,test}.parquet; --lines → line tables
+  baselines.py                 ✅ B2 (B1 is built into score.py)
+  score.py                     ✅ the scorer
   notebooks/data_tour.ipynb    ✅ head() of every dataset above, with readable times
   notebooks/                   ⏳ Colab: m1_lstm.ipynb, m2a_bilstm.ipynb, m2b_transformer.ipynb
   board/                       ⏳ live board (FastAPI + phone web app)
@@ -144,8 +152,9 @@ Measured on Oct 31 – Nov 13: history times run **30 s** (numbered lines) and *
 
 Data is **not** in git. It lives on the shared Google Drive folder `Countdown-Group8/`:
 - `raw/`: the recordings, one folder per week (`2026-10-31_to_2026-11-07/`, `2026-11-08_to_2026-11-14/`), with one subfolder per day holding `predictions.csv.gz` and `vehicles.csv.gz`. **Backup only; nobody trains on these directly.** The test week (Nov 15–21) is added on Nov 22.
-- `rows/`: the feature rows, `history.parquet`, `train.parquet` and `val.parquet`. **This is what Colab trains on.** Load with `pd.read_parquet('/content/drive/MyDrive/Countdown-Group8/rows/train.parquet')` after mounting Drive.
+- `rows/`: the feature rows, `history.parquet`, `train.parquet` and `val.parquet`, plus the line tables `line_history.parquet`, `line_train.parquet`, `line_val.parquet`. **This is what Colab trains on.** Load with `pd.read_parquet('/content/drive/MyDrive/Countdown-Group8/rows/train.parquet')` after mounting Drive. `test.parquet` and `line_test.parquet` are added only after every model is frozen.
 - `models/`: trained checkpoints.
+- `preds/val/`, `preds/test/`: each model's predictions, in the format above, for `score.py`.
 
 Only one set of rows is built (by `rows.py`, Yared), so every model trains and is scored on identical data.
 

@@ -7,6 +7,7 @@ and keeps only rows with the header's column count and a numeric poll field. It 
 
 Usage:  python repair.py data/raw/2026-11-08            repair both files of a day in place (originals to data/damaged/)
         python repair.py --check data/raw data/vm       list damaged files without changing anything
+        python repair.py --check data/vm/2026-11-20     (copy folders or day folders)
 """
 import argparse, glob, gzip, mmap, os, sys, zlib
 
@@ -85,7 +86,8 @@ def main():
     ap.add_argument('--check', action='store_true', help='only list damaged files')
     args = ap.parse_args()
     if args.check:
-        files = sorted(f for p in args.paths for f in glob.glob(os.path.join(p, '*', '*.csv.gz')))
+        files = sorted(f for p in args.paths                  # a copy folder (data/raw) or one day folder
+                       for f in glob.glob(os.path.join(p, '*', '*.csv.gz')) + glob.glob(os.path.join(p, '*.csv.gz')))
         bad = [f for f in files if is_damaged(f)]
         print('\n'.join(bad) if bad else f'all {len(files)} files OK')
         sys.exit(1 if bad else 0)

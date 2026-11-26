@@ -2,3 +2,4 @@ requests
 gtfs-realtime-bindings
 pandas
 pyarrow
+scikit-learn
